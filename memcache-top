@@ -92,7 +92,7 @@ $lifetime = 0;
 $bytes = 1;
 
 # Display get/set commands
-$commands = 1;
+$commands = 0;
 
 # Show cumulative stats (since start of run)
 $cumulative = 0;
@@ -102,22 +102,7 @@ $sleep = 3;
 
 # List of servers/ ports to query.
 @default_instances = (
-  '10.50.11.5:11211',
-  '10.50.11.5:11212',
-  '10.50.11.5:11213',
-  '10.50.12.5:11211',
-  '10.50.12.5:11212',
-  '10.50.12.5:11213',
-  '10.50.15.5:11211',
-  '10.50.15.5:11212',
-  '10.50.15.5:11213',
-  '10.50.9.90:11211',
-  '10.50.9.90:11212',
-  '10.50.9.90:11213',
-  '10.50.9.90:11214',
-  '10.50.9.90:11215',
-  '10.50.9.90:11216',
-
+  '127.0.0.1:11211',
 );
 
 # Default port to connect to, if not specified
