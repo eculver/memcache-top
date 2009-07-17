@@ -17,6 +17,8 @@
 #     - Specify read and write bytes w/ --bytes (default) or --nobytes
 #     - Specify get and set commands w/ --commands or --nocommands (default)
 #     - Specify cumulative numbers w/ --cumulative (don't use with lifetime)
+#     - Run a single time without clearing the screen, good for scripts and 
+#       the like: --oneoff
 #
 #   If Getopt::Long is not installed:
 #     - Specify sleep time by typing a number after the command.
@@ -60,9 +62,9 @@ use Time::HiRes 'time';
 
 my (@default_instances, @instances, $remote, $sleep, %threshold, %laststats,
     $usecolor, @keys, $default_port, $version, @out, $lifetime, $bytes, 
-    $commands, $cumulative);
+    $commands, $cumulative, $oneoff);
 
-$version = "0.6";
+$version = "0.7";
 
 ################################################################################
 # CONFIGURATION
@@ -100,6 +102,9 @@ $cumulative = 0;
 # Default time to sleep in-between refreshes.
 $sleep = 3;
 
+# Run a single time as a one-off without formatting:
+$oneoff = 0;
+
 # List of servers/ ports to query.
 @default_instances = (
   '127.0.0.1:11211',
@@ -135,6 +140,7 @@ if (@ARGV) {
       'bytes!'		=> \$bytes,
       'commands!'	=> \$commands,
       'cumulative!'	=> \$cumulative,
+      'oneoff'		=> \$oneoff,
     );
     if (@instances) {
       @instances = split(/,/,join(',',@instances));
@@ -157,6 +163,10 @@ if ( $usecolor ) {
   else { use Term::ANSIColor; }
 }
 
+if ( $oneoff ) {
+  $usecolor = 0;
+}
+
 my $i = 1;
 
 my (%original);
@@ -165,7 +175,7 @@ while ($i) {
 
   @out = ();
 
-  push @out,"\033[2J";			# This clears the screen, yo.
+  unless ($oneoff) { push @out,"\033[2J"; }			# This clears the screen, yo.
 
   push @out,color 'bold' if $usecolor;
   push @out,"\nmemcache-top v$version\t";
@@ -377,11 +387,15 @@ while ($i) {
     threshold_print( $tot{bytes_written}, $threshold{bytes_written}*$count, 1, 1, '', '%.0f');
   }
   push @out,color 'reset' if $usecolor;
-  push @out,"\n(ctrl-c to quit.)\n";
+  push @out,"\n";
+  unless ($oneoff) { push @out,"(ctrl-c to quit.)\n"; }
   sleep($sleep);
 
   print @out;
   $i++;
+
+  if ($oneoff) { exit 0; }
+
 }
 
 ################################################################################
