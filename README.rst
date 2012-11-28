@@ -1,8 +1,10 @@
-# memcache-top.pl
+memcache-top.pl
+===============
 
 "top" for memcache - watch the traffic and other stats in real-time.  Yoikes.
 
-# NOTES:
+NOTES
+-----
 
    If Getopt::Long is installed:
      - Specify instances w/ --instances (multiple times or comma separated)

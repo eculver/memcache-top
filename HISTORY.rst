@@ -1,4 +1,5 @@
-# HISTORY:
+HISTORY
+=======
 
 v0.3 - 2009-04-22 - ntang
   Minor cleanups.  First release to google code:
