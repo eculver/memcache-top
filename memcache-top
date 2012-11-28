@@ -77,6 +77,7 @@ $usecolor = 1;
     cache_hit		=> 60,		# Cache hit ratio
     usage		=> 90,		# % space used
     time		=> 5,		# Number of ms to run the stats query
+    curr_items  => 0,       # Number of items
     evictions		=> 0,		# Number of evictions per second
     curr_connections	=> 3500,	# Number of current connections
     bytes_read		=> 1000000,	# Bytes read, per second
@@ -116,7 +117,7 @@ $default_port = "11211";
 # END CONFIGURATION
 ################################################################################
 
-@keys = ('usage', 'cache_hit', 'curr_connections', 'time', 'cmd_get', 'cmd_set',
+@keys = ('usage', 'cache_hit', 'curr_connections', 'time', 'curr_items', 'cmd_get', 'cmd_set',
          'bytes_read', 'bytes_written', 'evictions', 'limit_maxbytes', 'bytes');
 
 if (@ARGV) {
@@ -185,7 +186,7 @@ while ($i) {
   push @out,"off," unless $usecolor;
   push @out," refresh: $sleep seconds)\n\n";
   push @out,color 'bold' if $usecolor;
-  push @out,"INSTANCE\t\tUSAGE\tHIT %\tCONN\tTIME\t";
+  push @out,"INSTANCE\t\tUSAGE\tHIT %\tCONN\tTIME\tITEMS\t";
   if ( $lifetime || $cumulative ) {
     push @out,"EVICT\t";
     push @out,"GETS\tSETS\t" if $commands;
@@ -309,6 +310,7 @@ while ($i) {
     $outstats{bytes} = $stats{bytes};
     $outstats{usage} = ( $stats{bytes} / $stats{limit_maxbytes} * 100 );
     $outstats{curr_connections} = $stats{curr_connections};
+    $outstats{curr_items} = $stats{curr_items};
 
     if ( $cumulative ) {
       foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
@@ -325,6 +327,7 @@ while ($i) {
     } else {
       threshold_print( $outstats{time}, $threshold{time}, 1, 0, 'ms', '%.1f');
     }
+    threshold_print( $outstats{curr_items}, $threshold{curr_items}, 1, 0, '', '%.0d');
     threshold_print( $outstats{evictions}, $threshold{evictions}, 1, 0, '', '%.1f');
     if ( $commands ) {
       threshold_print( $outstats{cmd_get}, $threshold{cmd_get}, 1, 0, '', '%.0f');
@@ -358,6 +361,7 @@ while ($i) {
   } else { 
     threshold_print( $tot{time}/$count, $threshold{time}, 1, 1, 'ms', '%.1f');
   }
+  threshold_print( $tot{curr_items}/$count, $threshold{curr_items}, 1, 1, '', '%.0d');
   threshold_print( $tot{evictions}/$count, $threshold{evictions}, 1, 1, '', '%.1f');
   if ( $commands ) {
     threshold_print( $tot{cmd_get}/$count, $threshold{cmd_get}, 1, 1, '', '%.0f');
@@ -377,6 +381,7 @@ while ($i) {
   } else {
     threshold_print( $tot{time}, $threshold{time}*$count, 1, 1, 'ms', '%.1f');
   }
+  threshold_print( $tot{curr_items}, $threshold{curr_items}*$count, 1, 1, '', '%.0d');
   threshold_print( $tot{evictions}, $threshold{evictions}*$count, 1, 1, '', '%.1f');
   if ( $commands ) {
     threshold_print( $tot{cmd_get}, $threshold{cmd_get}*$count, 1, 1, '', '%.0f');
