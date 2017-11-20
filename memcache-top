@@ -405,7 +405,7 @@ while ($i) {
 
 ################################################################################
 # threshold_print
-# takes two variables, compares them (greater then if $gt == 1), and then prints
+# takes two variables, compares them (greater than if $gt == 1), and then prints
 # it.  It uses red as the default color for successful comparisons, but sets 
 # it to red bold if $bold == 1.  $trail specifies trailing characters to print.
 # $sprintf lets you specify the format for sprintf().
