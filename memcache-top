@@ -1,456 +1,503 @@
 #!/usr/bin/perl -w
 
 ################################################################################
-# memcache-top.pl
+# memcache-top
 #
-# "top" for memcache - watch the traffic and other stats in real-time.  Yoikes.
+# "top" for memcache - watch the traffic and other stats in real-time.
 #
 # NOTES:
 #
-#   If Getopt::Long is installed:
-#     - Specify instances w/ --instances (multiple times or comma separated)
-#     - Specify default port w/ --port (defaults to 11211)
-#     - Specify sleep time w/ --sleep (default 3)
-#     - Specify color output w/ --color (default) or --nocolor
-#     - Specify lifetime stats w/ --lifetime or --nolifetime (default)
-#       NOTE: lifetime stats break thresholds for evictions, bytes.
-#     - Specify read and write bytes w/ --bytes (default) or --nobytes
-#     - Specify get and set commands w/ --commands or --nocommands (default)
-#     - Specify cumulative numbers w/ --cumulative (don't use with lifetime)
-#     - Run a single time without clearing the screen, good for scripts and 
-#       the like: --oneoff
+#   - Specify instances w/ --instances (required; multiple times or comma separated)
+#   - Specify default port w/ --port (defaults to 11211)
+#   - Specify sleep time w/ --sleep (default 3), or as a bare number
+#   - Specify color output w/ --color (default) or --nocolor
+#   - Specify language w/ --lang en|pt|es (default: from LANG, else en)
+#   - Specify lifetime stats (averaged over server uptime) w/ --lifetime
+#   - Specify read and write bytes columns w/ --bytes or --nobytes (default)
+#   - Specify get and set columns w/ --commands (default) or --nocommands
+#   - Specify cumulative numbers (since start of run) w/ --cumulative
+#   - Run a single time without clearing the screen, good for scripts and
+#     monitoring checks: --oneoff.  Exit code is 0 OK, 1 WARNING, 2 CRITICAL.
 #
-#   If Getopt::Long is not installed:
-#     - Specify sleep time by typing a number after the command.
-#   Specify instances in @default_instances.
-#   Specify thresholds by defining %threshold.
-#   Written against memcached v 1.2.3, but works fine w/ later versions.
+#   Thresholds live in %limit below.  Each metric has a warning (yellow) and
+#   a critical (red) level; the ALERTS panel explains what is wrong.
 #
-# HISTORY:
-#
-# v0.3 - 2009-04-22 - ntang
-#   Minor cleanups.  First release to google code:
-#   http://code.google.com/p/memcache-top/
-# v0.4 - 2009-04-23 - ntang
-#   Added ability to specify color, sleep time, and servers on command line.
-#   Also added checks for Getopt::Long and Term::ANSIColor.
-#   Added $default_port = "11211" and padding for short server names.  Server 
-#     names over 23 characters inc. port will break the column lineups for now.
-# v0.4b - 2009-04-23 - ntang
-#   Added total capacity, and changed "SERVER" to "INSTANCE" to be more clear.
-#     Server now is the hostname, instance is hostname + port.  It will
-#     truncate the instance and/or server to fit inside the first column
-#     correctly.  (Yay!)  It'll also truncate long reads/ writes (or
-#     technically any number) to K or M or G if it exceeds certain limits for
-#     readability.
-# v0.5 - 2009-04-24 - ntang
-#   Cleaned up instances vs. servers so it's internally consistent.
-#   Redid printing so that now it stores it all and only refreshes/ prints when
-#     it has the full set of data.  Warning: major hackishness.
-#   Switched to per-second stats by default w/ lifetime stats available.
-# v0.6 - 2009-04-28 - ntang
-#   I lied.  One more change... the ability to specify read/write bytes, or 
-#     get/set commands, or both.  Bear in mind if you specify both you will 
-#     exceed the width of a standard terminal!  You've been warned.  :P
-#   Also, some minor display changes, etc. etc.
+# Maintainer: Raphael Giovanini.  Original author: Nicholas Tang (2009).
+# HISTORY: see HISTORY.rst
 #
 ################################################################################
 
 use strict;
+use utf8;
 use IO::Socket;
-use Time::HiRes 'time';
+use Time::HiRes qw(time sleep);
+use POSIX qw(strftime);
+use List::Util qw(max);
+use Getopt::Long;
+use Term::ANSIColor;
 
-my (@default_instances, @instances, $remote, $sleep, %threshold, %laststats,
-    $usecolor, @keys, $default_port, $version, @out, $lifetime, $bytes, 
-    $commands, $cumulative, $oneoff);
-
-$version = "0.7";
+my $version = "0.9";
 
 ################################################################################
 # CONFIGURATION
 
-# Set $usecolor to 1 to push @out,in, gasp, color.
-$usecolor = 1;
-
-# 'Alert' threshold values at which to color the text red.
-%threshold = (
-    cache_hit		=> 60,		# Cache hit ratio
-    usage		=> 90,		# % space used
-    time		=> 5,		# Number of ms to run the stats query
-    curr_items  => 0,       # Number of items
-    evictions		=> 0,		# Number of evictions per second
-    curr_connections	=> 3500,	# Number of current connections
-    bytes_read		=> 1000000,	# Bytes read, per second
-    bytes_written	=> 1000000,	# Bytes written, per second
-    limit_maxbytes	=> 0,		# Total space allocated
-    bytes		=> 0,		# Total space used
-    cmd_get		=> 1000,	# Get commands
-    cmd_set		=> 1000,	# Set commands
+# [warning, critical].  hit_ratio is "lower is worse", everything else higher.
+my %limit = (
+  evictions => [1, 50],      # evictions per second
+  hit_ratio => [80, 50],     # % of gets that hit, only checked above $min_gets
+  conn_pct  => [80, 95],     # curr_connections as % of max_connections
+  latency   => [50, 250],    # ms for one 'stats' round-trip
+  mem       => [90, 98],     # % of limit_maxbytes; color only, a full cache is normal
 );
+my $min_gets   = 10;         # gets/s below which the hit ratio is just noise
+my $warming    = 600;        # seconds of uptime during which the cache is "cold"
+my $timeout    = 3;          # seconds to wait on an instance before calling it DOWN
 
-# Display lifetime stats instead of per-second stats
-$lifetime = 0;
-
-# Display read/write bytes
-$bytes = 1;
-
-# Display get/set commands
-$commands = 0;
-
-# Show cumulative stats (since start of run)
-$cumulative = 0;
-
-# Default time to sleep in-between refreshes.
-$sleep = 3;
-
-# Run a single time as a one-off without formatting:
-$oneoff = 0;
-
-# List of servers/ ports to query.
-@default_instances = (
-  '127.0.0.1:11211',
-);
-
-# Default port to connect to, if not specified
-$default_port = "11211";
+my $usecolor   = 1;
+my $lifetime   = 0;
+my $bytes      = 0;
+my $commands   = 1;
+my $cumulative = 0;
+my $sleep      = 3;
+my $oneoff     = 0;
+my $default_port = 11211;
 
 # END CONFIGURATION
 ################################################################################
+# Translations.  Picked from LC_ALL / LC_MESSAGES / LANG, or --lang.  Missing
+# keys fall back to English.  To add a language, copy the 'en' block.
 
-@keys = ('usage', 'cache_hit', 'curr_connections', 'time', 'curr_items', 'cmd_get', 'cmd_set',
-         'bytes_read', 'bytes_written', 'evictions', 'limit_maxbytes', 'bytes');
+my %msg = (
+  en => {
+    usage       => "USAGE: memcache-top --instances h:p,... [--sleep N] [--lang en|pt|es] [--oneoff] ...\n",
+    refresh     => 'refresh %ds',
+    up          => '%d/%d up',
+    per_second  => 'per-second',
+    lifetime    => 'lifetime avg',
+    cumulative  => 'cumulative',
+    ok          => 'OK',
+    warning     => 'WARNING',
+    critical    => 'CRITICAL',
+    tag_warn    => 'WARN',
+    tag_crit    => 'CRIT',
+    instance    => 'INSTANCE',
+    uptime      => 'UPTIME',
+    items       => 'Items',
+    na          => 'n/a',
+    down        => 'DOWN - no response',
+    unreachable => "unreachable (connect or 'stats' failed within %ds)",
+    cold        => 'uptime %s - recently restarted, cache is cold',
+    slow        => "'stats' took %.0fms - server overloaded or network slow",
+    conn        => '%d/%d connections (%.0f%%) - near max_connections (-c)',
+    rejecting   => 'rejecting connections - max_connections reached, clients are failing',
+    evicting    => 'evicting %s items%s with memory %.0f%% full - cache too small (-m)',
+    hit         => 'hit ratio %.1f%% at %s gets/s - most reads go to the backend',
+    alerts      => 'ALERTS (%d)',
+    none        => 'No problems detected.',
+    quit        => '(ctrl-c to quit)',
+  },
+  pt => {
+    usage       => "USO: memcache-top --instances h:p,... [--sleep N] [--lang en|pt|es] [--oneoff] ...\n",
+    refresh     => 'atualiza %ds',
+    up          => '%d/%d no ar',
+    per_second  => 'por segundo',
+    lifetime    => 'média desde o início',
+    cumulative  => 'acumulado',
+    ok          => 'OK',
+    warning     => 'ALERTA',
+    critical    => 'CRÍTICO',
+    tag_warn    => 'AVISO',
+    tag_crit    => 'CRÍT',
+    instance    => 'INSTÂNCIA',
+    uptime      => 'NO AR',
+    items       => 'Itens',
+    na          => 'n/d',
+    down        => 'FORA - sem resposta',
+    unreachable => "inacessível (conexão ou 'stats' falhou em %ds)",
+    cold        => 'no ar há %s - reiniciado há pouco, cache frio',
+    slow        => "'stats' levou %.0fms - servidor sobrecarregado ou rede lenta",
+    conn        => '%d/%d conexões (%.0f%%) - perto do max_connections (-c)',
+    rejecting   => 'recusando conexões - max_connections atingido, clientes falhando',
+    evicting    => 'removendo %s itens%s com memória %.0f%% cheia - cache pequeno demais (-m)',
+    hit         => 'taxa de acerto %.1f%% com %s gets/s - a maioria das leituras vai ao backend',
+    alerts      => 'ALERTAS (%d)',
+    none        => 'Nenhum problema detectado.',
+    quit        => '(ctrl-c para sair)',
+  },
+  es => {
+    usage       => "USO: memcache-top --instances h:p,... [--sleep N] [--lang en|pt|es] [--oneoff] ...\n",
+    refresh     => 'refresco %ds',
+    up          => '%d/%d activas',
+    per_second  => 'por segundo',
+    lifetime    => 'promedio histórico',
+    cumulative  => 'acumulado',
+    ok          => 'OK',
+    warning     => 'AVISO',
+    critical    => 'CRÍTICO',
+    tag_warn    => 'AVISO',
+    tag_crit    => 'CRÍT',
+    instance    => 'INSTANCIA',
+    uptime      => 'ACTIVA',
+    items       => 'Ítems',
+    na          => 'n/d',
+    down        => 'CAÍDA - sin respuesta',
+    unreachable => "inaccesible (conexión o 'stats' falló en %ds)",
+    cold        => 'activa hace %s - reiniciada hace poco, caché fría',
+    slow        => "'stats' tardó %.0fms - servidor sobrecargado o red lenta",
+    conn        => '%d/%d conexiones (%.0f%%) - cerca de max_connections (-c)',
+    rejecting   => 'rechazando conexiones - max_connections alcanzado, los clientes fallan',
+    evicting    => 'desalojando %s ítems%s con memoria %.0f%% llena - caché demasiado pequeña (-m)',
+    hit         => 'tasa de aciertos %.1f%% con %s gets/s - la mayoría de lecturas va al backend',
+    alerts      => 'ALERTAS (%d)',
+    none        => 'No se detectaron problemas.',
+    quit        => '(ctrl-c para salir)',
+  },
+);
 
-if (@ARGV) {
-  eval { require Getopt::Long; };
-  if ($@) {
-    if ( $ARGV[0] =~ /^\d+$/ ) {
-      $sleep = $ARGV[0];
-    }
-    else {
-      die "USAGE: memcache-top.pl <optional number of seconds to sleep>\n";
-    }
-  }
-  else {
-    use Getopt::Long;
-    GetOptions (
-      'instances=s'	=> \@instances,
-      'sleep=i'		=> \$sleep,
-      'port=i'		=> \$default_port,
-      'color!'		=> \$usecolor,
-      'lifetime!'	=> \$lifetime,
-      'bytes!'		=> \$bytes,
-      'commands!'	=> \$commands,
-      'cumulative!'	=> \$cumulative,
-      'oneoff'		=> \$oneoff,
-    );
-    if (@instances) {
-      @instances = split(/,/,join(',',@instances));
-    } else {
-      @instances = @default_instances;
-    }
-  }
+my $lang = lc substr($ENV{LC_ALL} || $ENV{LC_MESSAGES} || $ENV{LANG} || 'en', 0, 2);
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+
+my @instances;
+GetOptions(
+  'instances=s' => \@instances,
+  'lang=s'      => \$lang,
+  'sleep=i'     => \$sleep,
+  'port=i'      => \$default_port,
+  'color!'      => \$usecolor,
+  'lifetime!'   => \$lifetime,
+  'bytes!'      => \$bytes,
+  'commands!'   => \$commands,
+  'cumulative!' => \$cumulative,
+  'oneoff'      => \$oneoff,
+) or usage();
+$lang = 'en' unless $msg{lc $lang};
+$lang = lc $lang;
+$sleep = shift @ARGV if @ARGV && $ARGV[0] =~ /^\d+$/;
+$sleep = 1 if $sleep < 1;
+usage() unless @instances;
+@instances = split(/,/, join(',', @instances));
+@instances = map { /:\d+$/ ? $_ : "$_:$default_port" } @instances;
+$lifetime = 0 if $cumulative;
+$usecolor = 0 if $oneoff || !-t STDOUT;
+
+my @counters = qw(cmd_get cmd_set get_hits get_misses evictions bytes_read
+                  bytes_written rejected_connections listen_disabled_num);
+my @lvlname  = ('ok', 'warning', 'critical');
+my @lvlcolor = ('green', 'yellow', 'bold red');
+
+my (%sock, %prev, %first);
+
+$SIG{PIPE} = 'IGNORE';
+my $screen = 0;
+unless ($oneoff) {
+  print "\033[?1049h\033[?25l";                    # alternate screen, hide cursor
+  $screen = 1;
+  $SIG{INT} = $SIG{TERM} = sub { exit 0 };
 }
-else {
-  @instances = @default_instances;
+END { print "\033[?25h\033[?1049l" if $screen }
+
+if ($oneoff) {
+  # Rates need two samples; lifetime/cumulative-from-zero don't.
+  unless ($lifetime) { sample($_) for @instances; sleep $sleep; }
+  my ($frame, $status) = frame();
+  print $frame;
+  exit $status;
 }
 
-if ( $lifetime && $cumulative ) {
-  $lifetime = 0;
-}
-
-if ( $usecolor ) {
-  eval { require Term::ANSIColor; };
-  if ($@) { $usecolor = 0; }
-  else { use Term::ANSIColor; }
-}
-
-if ( $oneoff ) {
-  $usecolor = 0;
-}
-
-my $i = 1;
-
-my (%original);
-
-while ($i) {
-
-  @out = ();
-
-  unless ($oneoff) { push @out,"\033[2J"; }			# This clears the screen, yo.
-
-  push @out,color 'bold' if $usecolor;
-  push @out,"\nmemcache-top v$version\t";
-  push @out,color 'reset' if $usecolor;
-  push @out,"(default port: " . sprintf("%5d",$default_port) . ", color: ";
-  push @out,"on," if $usecolor;
-  push @out,"off," unless $usecolor;
-  push @out," refresh: $sleep seconds)\n\n";
-  push @out,color 'bold' if $usecolor;
-  push @out,"INSTANCE\t\tUSAGE\tHIT %\tCONN\tTIME\tITEMS\t";
-  if ( $lifetime || $cumulative ) {
-    push @out,"EVICT\t";
-    push @out,"GETS\tSETS\t" if $commands;
-    push @out,"READ\tWRITE\t" if $bytes;
-    push @out,"\n";
-  } else {
-    push @out,"EVICT/s ";
-    push @out,"GETS/s\tSETS/s\t" if $commands;
-    push @out,"READ/s\tWRITE/s\t" if $bytes;
-    push @out,"\n";
-  }
-  push @out,color 'reset' if $usecolor;
-
-  my %tot;
-
-  foreach my $key (@keys) {
-    $tot{$key} = 0;
-  }
-  
-  my $count = 0;
-
-  foreach my $instance (@instances) {
-
-    my ($port, $server);
-
-    my @split = split(/:/,$instance);
-    unless ( $split[1] ) {
-      $instance = $instance . ":" . $default_port;
-      $port = $default_port;
-    }
-    else {
-      $port = $split[1];
-    }
-
-# Some exhaustive (exhausting?) logic to determine the ideal text to push @out,for
-# the server name.
-    if ( length($instance) > 22 ) {
-      if ( $port ne $default_port ) {
-        $server = substr($split[0],0,17) . ":" . $port;
-      }
-      else {
-        if ( length($split[0]) < 18 ) {
-          $server = $instance;
-        }
-        else {
-          $server = substr($split[0],0,23);
-        }
-      }
-    }
-    elsif ( length($instance) < 8 ) {
-      $server = "$instance\t\t";
-    }
-    elsif ( length($instance) < 16 ) {
-      $server = "$instance\t";
-    }
-    else {
-      $server = $instance;
-    }
-
-    my $t0 = time();
-
-    $remote = IO::Socket::INET->new($instance);
-    unless ( defined($remote) ) { 
-      push @out,color 'red' if $usecolor;
-      push @out,$instance . " is DOWN.\n";
-      $count++;
-      push @out,color 'reset' if $usecolor;
-      next; 
-    }
-
-    $remote->autoflush(1);
-    $count++;
-
-    print $remote "stats\n";
-
-    my (%stats, %outstats);
-
-    foreach my $key (@keys) {
-      $outstats{$key} = 0;
-    }
-
-    LINE: while ( defined ( my $line = <$remote> ) ) {
-      last LINE if ( $line =~ /END/ );
-      chomp $line;
-      my @bits = split(' ',$line);
-      $stats{$bits[1]} = $bits[2];
-      next LINE;
-    }
-
-    close $remote;
-
-    my $t1 = time();
-    $outstats{time} = ($t1 - $t0) * 1000;
-
-    if ( $lifetime || $cumulative) {
-      foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
-        if ( $cumulative ) {
-          if ( $i == 1 ) {
-            $original{$instance}{$key} = $stats{$key};
-          } else {
-            $outstats{$key} = $stats{$key} - $original{$instance}{$key};
-          }
-        } else {
-          $outstats{$key} = $stats{$key};
-        }
-      }
-      $outstats{cache_hit} = ( $stats{get_hits} / $stats{cmd_get} ) * 100;
-    } else {
-      foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
-        if ( defined ( $laststats{$instance}{$key} ) ) {
-          $outstats{$key} = ($stats{$key} - $laststats{$instance}{$key}) / $sleep;
-        }
-      }
-      $outstats{cache_hit} = 0;
-      if ( defined($outstats{get_misses}) && $outstats{get_misses} > 0 ) {
-        $outstats{cache_hit} = ( $laststats{$instance}{get_hits} / $laststats{$instance}{cmd_get} ) * 100;
-      }
-    }
-
-    $outstats{limit_maxbytes} = $stats{limit_maxbytes};
-    $outstats{bytes} = $stats{bytes};
-    $outstats{usage} = ( $stats{bytes} / $stats{limit_maxbytes} * 100 );
-    $outstats{curr_connections} = $stats{curr_connections};
-    $outstats{curr_items} = $stats{curr_items};
-
-    if ( $cumulative ) {
-      foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
-        $threshold{$key} = $threshold{$key} * $i if $threshold{$key};
-      }
-    }
-
-    push @out,"$server\t";
-    threshold_print( $outstats{usage}, $threshold{usage}, 1, 0, '%', '%.1f');
-    threshold_print( $outstats{cache_hit}, $threshold{cache_hit}, 0, 0, '%', '%.1f');
-    threshold_print( $outstats{curr_connections}, $threshold{curr_connections}, 1, 0, '', '%.0d');
-    if ( $outstats{time} >= 1000 ) {
-      threshold_print( $outstats{time}/1000, $threshold{time}/1000, 1, 0, 's', '%.2f');
-    } else {
-      threshold_print( $outstats{time}, $threshold{time}, 1, 0, 'ms', '%.1f');
-    }
-    threshold_print( $outstats{curr_items}, $threshold{curr_items}, 1, 0, '', '%.0d');
-    threshold_print( $outstats{evictions}, $threshold{evictions}, 1, 0, '', '%.1f');
-    if ( $commands ) {
-      threshold_print( $outstats{cmd_get}, $threshold{cmd_get}, 1, 0, '', '%.0f');
-      threshold_print( $outstats{cmd_set}, $threshold{cmd_set}, 1, 0, '', '%.0f');
-    }
-    if ( $bytes ) {
-      threshold_print( $outstats{bytes_read}, $threshold{bytes_read}, 1, 0, '', '%.0f');
-      threshold_print( $outstats{bytes_written}, $threshold{bytes_written}, 1, 0, '', '%.0f');
-    }
-    push @out,"\n";
-
-    foreach my $key (@keys) {
-      $tot{$key} = $tot{$key} + $outstats{$key};
-    }
-
-    unless ( $lifetime || $cumulative ) {
-      foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
-        $laststats{$instance}{$key} = $stats{$key};
-      }
-    }
-
-  }
-
-  push @out,color 'bold' if $usecolor;
-  push @out,"\nAVERAGE:\t\t";
-  threshold_print( $tot{usage}/$count, $threshold{usage}, 1, 1, '%', '%.1f');
-  threshold_print( $tot{cache_hit}/$count, $threshold{cache_hit}, 0, 1, '%', '%.1f');
-  threshold_print( $tot{curr_connections}/$count, $threshold{curr_connections}, 1, 1, '', '%.0d');
-  if ( ( $tot{time}/$count ) >= 1000 ) {
-    threshold_print( ($tot{time}/$count)/1000, $threshold{time}/1000, 1, 1, 's', '%.2f');
-  } else { 
-    threshold_print( $tot{time}/$count, $threshold{time}, 1, 1, 'ms', '%.1f');
-  }
-  threshold_print( $tot{curr_items}/$count, $threshold{curr_items}, 1, 1, '', '%.0d');
-  threshold_print( $tot{evictions}/$count, $threshold{evictions}, 1, 1, '', '%.1f');
-  if ( $commands ) {
-    threshold_print( $tot{cmd_get}/$count, $threshold{cmd_get}, 1, 1, '', '%.0f');
-    threshold_print( $tot{cmd_set}/$count, $threshold{cmd_set}, 1, 1, '', '%.0f');
-  }
-  if ( $bytes ) {
-    threshold_print( $tot{bytes_read}/$count, $threshold{bytes_read}, 1, 1, '', '%.0f');
-    threshold_print( $tot{bytes_written}/$count, $threshold{bytes_written}, 1, 1, '', '%.0f');
-  }
-  push @out,"\n";
-  push @out,"\nTOTAL:\t\t";
-  threshold_print( $tot{bytes}, $threshold{bytes}, 0, 1, 'B/', '%.0f');
-  threshold_print( $tot{limit_maxbytes}, $threshold{limit_maxbytes}, 0, 1, "B\t", '%.0f');
-  threshold_print( $tot{curr_connections}, $threshold{curr_connections}*$count, 1, 1, '', '%.0d');
-  if ( $tot{time} >= 1000 ) {
-    threshold_print( $tot{time}/1000, ($threshold{time}*$count)/1000, 1, 1, 's', '%.2f');
-  } else {
-    threshold_print( $tot{time}, $threshold{time}*$count, 1, 1, 'ms', '%.1f');
-  }
-  threshold_print( $tot{curr_items}, $threshold{curr_items}*$count, 1, 1, '', '%.0d');
-  threshold_print( $tot{evictions}, $threshold{evictions}*$count, 1, 1, '', '%.1f');
-  if ( $commands ) {
-    threshold_print( $tot{cmd_get}, $threshold{cmd_get}*$count, 1, 1, '', '%.0f');
-    threshold_print( $tot{cmd_set}, $threshold{cmd_set}*$count, 1, 1, '', '%.0f');
-  }
-  if ( $bytes ) {
-    threshold_print( $tot{bytes_read}, $threshold{bytes_read}*$count, 1, 1, '', '%.0f');
-    threshold_print( $tot{bytes_written}, $threshold{bytes_written}*$count, 1, 1, '', '%.0f');
-  }
-  push @out,color 'reset' if $usecolor;
-  push @out,"\n";
-  unless ($oneoff) { push @out,"(ctrl-c to quit.)\n"; }
-  sleep($sleep);
-
-  print @out;
-  $i++;
-
-  if ($oneoff) { exit 0; }
-
+while (1) {
+  my ($frame) = frame();
+  print "\033[H\033[2J", $frame;
+  sleep $sleep;
 }
 
 ################################################################################
-# threshold_print
-# takes two variables, compares them (greater than if $gt == 1), and then prints
-# it.  It uses red as the default color for successful comparisons, but sets 
-# it to red bold if $bold == 1.  $trail specifies trailing characters to print.
-# $sprintf lets you specify the format for sprintf().
+# frame: polls every instance, returns (screen text, worst alert level).
 #
-sub threshold_print { 
+sub frame {
+  my (@rows, @alerts, %tot);
+  my %worst = (mem => 0, conn => 0);   # meters show the worst instance, not just the cluster average
+  my $up = 0;
 
-  my ($stat, $threshold, $gt, $bold, $trail, $sprintf) = @_;
+  foreach my $inst (@instances) {
+    my $r = sample($inst);
+    unless ($r) {
+      push @rows, paint(sprintf("%-21s %s", shortname($inst), T('down')), 2);
+      push @alerts, [2, $inst, T('unreachable', $timeout)];
+      next;
+    }
+    $up++;
+    push @alerts, map { [$_->[0], $inst, $_->[1]] } check($r);
+    push @rows, row($inst, $r);
+    $tot{$_} += $r->{$_} // 0
+      for qw(bytes limit_maxbytes curr_connections max_connections curr_items
+             cmd_get cmd_set get_hits get_misses evictions bytes_read bytes_written);
+    $tot{rated}++ if defined $r->{hit};
+    $worst{mem} = max($worst{mem}, level(100 * $r->{bytes} / $r->{limit_maxbytes}, q(mem))) if $r->{limit_maxbytes};
+    $worst{conn} = max($worst{conn}, level(100 * $r->{curr_connections} / $r->{max_connections}, q(conn_pct))) if $r->{max_connections};
+  }
 
-  my $color = 'red';
-  my $offcolor = 'reset';
-  if ( $bold ) {
-    $color = 'bold red';
-    $offcolor = 'reset bold';
-  } 
+  my $status = 0;
+  $status = $_->[0] > $status ? $_->[0] : $status for @alerts;
 
-  if ( $gt ) {
-    if ( $stat > $threshold ) {
-      push @out, color $color if $usecolor;
+  my @o;
+  push @o, paint("memcache-top v$version", 'bold')
+         . strftime("  %Y-%m-%d %H:%M:%S", localtime)
+         . '  ' . T('refresh', $sleep) . '  ' . mode() . '  ' . T('up', $up, scalar @instances) . '  '
+         . paint(' ' . T($lvlname[$status]) . ' ',$status == 0 ? 'green'
+                                      : $status == 1 ? 'black on_yellow' : 'bold white on_red')
+         . "\n\n";
+
+  # htop-style meters for the whole cluster.
+  my $mem = $tot{limit_maxbytes} ? 100 * $tot{bytes} / $tot{limit_maxbytes} : 0;
+  my $gets = $tot{rated} ? $tot{get_hits} + $tot{get_misses} : 0;
+  my $hit = $gets ? 100 * $tot{get_hits} / $gets : undef;
+  my $conn = $tot{max_connections} ? 100 * $tot{curr_connections} / $tot{max_connections} : undef;
+  push @o, meter('Mem', $mem, human_bytes($tot{bytes}) . '/' . human_bytes($tot{limit_maxbytes}), max(level($mem, 'mem'), $worst{mem})) . '  '
+         . meter('Hit', $hit, defined $hit ? sprintf('%.1f%%', $hit) : T('na'), $gets && $tot{cmd_get} >= $min_gets ? level($hit, 'hit_ratio', 1) : 0)
+         . "\n";
+  push @o, meter('Con', $conn, ($tot{curr_connections} // 0) . ($tot{max_connections} ? "/$tot{max_connections}" : ''), max(level($conn, 'conn_pct'), $worst{conn})) . '  '
+         . sprintf(T('items') . " %s  Get %s  Set %s  Evict %s  Rx %s  Tx %s",
+                   human_num($tot{curr_items}), unit(human_num($tot{cmd_get})), unit(human_num($tot{cmd_set})),
+                   unit(human_num($tot{evictions})), unit(human_bytes($tot{bytes_read})), unit(human_bytes($tot{bytes_written})))
+         . "\n\n";
+
+  my $s = $cumulative ? '' : '/s';
+  my $head = sprintf("%-21s %6s %6s %6s", T('instance'), T('uptime'), 'MEM%', 'HIT%');
+  $head .= sprintf(" %7s %7s", "GET$s", "SET$s") if $commands;
+  $head .= sprintf(" %8s %10s %7s", "EVICT$s", 'CONN', 'LAT');
+  $head .= sprintf(" %7s %7s", "RX$s", "TX$s") if $bytes;
+  push @o, paint($head, 'bold'), "\n";
+  push @o, map { "$_\n" } @rows;
+
+  push @o, "\n", paint(T('alerts', scalar @alerts), 'bold'), "\n";
+  if (@alerts) {
+    foreach my $a (sort { $b->[0] <=> $a->[0] } @alerts) {
+      push @o, paint(sprintf("  %-5s", T($a->[0] == 2 ? 'tag_crit' : 'tag_warn')), $a->[0])
+             . sprintf(" %-21s  %s\n", shortname($a->[1]), $a->[2]);
     }
   } else {
-    if ( $stat < $threshold ) {
-      push @out, color $color if $usecolor;
-    }
+    push @o, paint('  ' . T('none'), 0), "\n";
+  }
+  push @o, "\n" . T('quit') . "\n" unless $oneoff;
+
+  return (join('', @o), $status);
+}
+
+################################################################################
+# sample: fetch stats and turn counters into rates (or totals) for one instance.
+# Returns undef if the instance is down.
+#
+sub sample {
+  my ($inst) = @_;
+  my $s = fetch($inst) or return;
+  my $p = $prev{$inst};
+
+  # Counters reset on restart: start over instead of showing negative rates.
+  if ($p && ($s->{uptime} // 0) < ($p->{uptime} // 0)) {
+    undef $p;
+    delete $first{$inst};
   }
 
-  if ( $stat > 999999999999 ) {
-    $stat = $stat / (1024*1024*1024*1024);
-    $trail = 'T' . $trail;
-    $sprintf = '%.1f';
-  } elsif ( $stat > 99999999 ) {
-    $stat = $stat / (1024*1024*1024);
-    $trail = "G" . $trail;
-    $sprintf = '%.1f';
-  } elsif ( $stat > 999999 ) {
-    $stat = $stat / (1024*1024);
-    $trail = 'M' . $trail;
-    $sprintf = '%.1f';
-  } elsif ( $stat > 9999 ) {
-    $stat = $stat/1024;
-    $trail = 'K' . $trail;
-    $sprintf = '%.1f';
+  my ($base, $elapsed);
+  if ($lifetime) {
+    ($base, $elapsed) = ({}, $s->{uptime} || 1);
+  } elsif ($cumulative) {
+    $first{$inst} ||= $s;
+    ($base, $elapsed) = ($first{$inst}, $s->{_time} - $first{$inst}{_time});
+  } elsif ($p) {
+    ($base, $elapsed) = ($p, $s->{_time} - $p->{_time});
   }
-  
-  push @out,sprintf($sprintf,$stat) . $trail;
-  push @out,color $offcolor if $usecolor;
-  push @out,"\t";
+  $prev{$inst} = $s;
+
+  my %r = map { $_ => $s->{$_} }
+          qw(uptime bytes limit_maxbytes curr_connections max_connections curr_items _latency);
+  return \%r unless $base;
+
+  my %d = map { $_ => ($s->{$_} // 0) - ($base->{$_} // 0) } @counters;
+  my $div = $cumulative ? 1 : ($elapsed || 1);
+  $r{$_} = $d{$_} / $div for @counters;
+  $r{get_rate} = $elapsed ? $d{cmd_get} / $elapsed : 0;
+  $r{rejected} = $d{rejected_connections} + $d{listen_disabled_num};
+  my $gets = $d{get_hits} + $d{get_misses};
+  $r{hit} = $gets ? 100 * $d{get_hits} / $gets : undef;
+  $r{rated} = 1;
+  return \%r;
+}
+
+# fetch: one 'stats' round-trip over a persistent connection, retried once so a
+# stale socket (e.g. after a server restart) doesn't show up as DOWN.
+sub fetch {
+  my ($inst) = @_;
+  for (1 .. 2) {
+    my %s;
+    my $ok = eval {
+      local $SIG{ALRM} = sub { die "timeout\n" };
+      alarm $timeout;
+      $sock{$inst} ||= IO::Socket::INET->new(PeerAddr => $inst, Timeout => $timeout)
+        or die "connect\n";
+      my $fh = $sock{$inst};
+      $fh->autoflush(1);
+      my $t0 = time;
+      print $fh "stats\r\n" or die "write\n";
+      while (defined(my $line = <$fh>)) {
+        last if $line =~ /^END/;
+        $s{$1} = $2 if $line =~ /^STAT (\S+) (\S+)/;
+      }
+      die "eof\n" unless %s;
+      $s{_latency} = (time - $t0) * 1000;
+      alarm 0;
+      1;
+    };
+    alarm 0;
+    if ($ok) { $s{_time} = time; return \%s; }
+    close $sock{$inst} if $sock{$inst};
+    delete $sock{$inst};
+  }
+  return;
+}
+
+################################################################################
+# check: the actual "do I have a problem?" logic.  Returns ([level, message]...).
+#
+sub check {
+  my ($r) = @_;
+  my @a;
+  my $mem = $r->{limit_maxbytes} ? 100 * $r->{bytes} / $r->{limit_maxbytes} : 0;
+
+  if (defined $r->{uptime} && $r->{uptime} < $warming) {
+    push @a, [1, T('cold', human_time($r->{uptime}))];
+  }
+  if (my $l = level($r->{_latency}, 'latency')) {
+    push @a, [$l, T('slow', $r->{_latency})];
+  }
+  if ($r->{max_connections}) {
+    my $pct = 100 * $r->{curr_connections} / $r->{max_connections};
+    if (my $l = level($pct, 'conn_pct')) {
+      push @a, [$l, T('conn', $r->{curr_connections}, $r->{max_connections}, $pct)];
+    }
+  }
+  return @a unless $r->{rated};
+
+  if ($r->{rejected} > 0) {
+    push @a, [2, T('rejecting')];
+  }
+  if (my $l = level($r->{evictions}, 'evictions')) {
+    push @a, [$l, T('evicting', human_num($r->{evictions}), $cumulative ? '' : '/s', $mem)];
+  }
+  if (defined $r->{hit} && $r->{get_rate} >= $min_gets) {
+    if (my $l = level($r->{hit}, 'hit_ratio', 1)) {
+      push @a, [$l, T('hit', $r->{hit}, human_num($r->{get_rate}))];
+    }
+  }
+  return @a;
+}
+
+################################################################################
+# Display helpers.
+
+sub row {
+  my ($inst, $r) = @_;
+  my $mem = $r->{limit_maxbytes} ? 100 * $r->{bytes} / $r->{limit_maxbytes} : 0;
+  my $hitlvl = defined $r->{hit} && $r->{get_rate} >= $min_gets ? level($r->{hit}, 'hit_ratio', 1) : 0;
+  my $conn = ($r->{curr_connections} // 0) . ($r->{max_connections} ? "/$r->{max_connections}" : '');
+  my $connlvl = $r->{max_connections} ? level(100 * $r->{curr_connections} / $r->{max_connections}, 'conn_pct') : 0;
+  $connlvl = 2 if $r->{rejected};
+
+  my $line = sprintf("%-21s", shortname($inst))
+    . cell(6, defined $r->{uptime} ? human_time($r->{uptime}) : '-',
+           defined $r->{uptime} && $r->{uptime} < $warming ? 1 : 0)
+    . cell(6, sprintf('%.1f', $mem), level($mem, 'mem'))
+    . cell(6, defined $r->{hit} ? sprintf('%.1f', $r->{hit}) : '-', $hitlvl);
+  $line .= cell(7, human_num($r->{cmd_get})) . cell(7, human_num($r->{cmd_set})) if $commands;
+  $line .= cell(8, human_num($r->{evictions}), $r->{rated} ? level($r->{evictions}, 'evictions') : 0)
+         . cell(10, $conn, $connlvl)
+         . cell(7, sprintf('%.1fms', $r->{_latency}), level($r->{_latency}, 'latency'));
+  $line .= cell(7, human_bytes($r->{bytes_read})) . cell(7, human_bytes($r->{bytes_written})) if $bytes;
+  return $line;
+}
+
+# level: 0 OK, 1 warning, 2 critical.  $low means lower values are worse.
+sub level {
+  my ($v, $key, $low) = @_;
+  return 0 unless defined $v;
+  my ($warn, $crit) = @{ $limit{$key} };
+  return $low ? ($v < $crit ? 2 : $v < $warn ? 1 : 0)
+              : ($v >= $crit ? 2 : $v >= $warn ? 1 : 0);
+}
+
+# Pad first, then color, so escape codes don't break the column alignment.
+sub cell {
+  my ($w, $text, $lvl) = @_;
+  return ' ' . paint(sprintf("%*s", $w, $text), $lvl ? $lvl : undef);
+}
+
+sub paint {
+  my ($text, $style) = @_;
+  return $text unless $usecolor && defined $style;
+  $style = $lvlcolor[$style] if $style =~ /^\d$/;
+  return color($style) . $text . color('reset');
+}
+
+# htop-style bar: Mem[|||||||       2.6M/4.0G].  Plain ASCII, so it works in
+# any terminal.  Green when fine, yellow/red past a threshold.
+sub meter {
+  my ($label, $pct, $text, $lvl) = @_;
+  my $w = 30;
+  my $fill = defined $pct ? int($w * ($pct > 100 ? 100 : $pct) / 100 + 0.5) : 0;
+  $fill = 1 if defined $pct && $pct > 0 && !$fill;
+  my $bar = (q(|) x $fill) . (q( ) x ($w - $fill));
+  substr($bar, $w - length($text), length($text), $text) if length($text) < $w;
+  return paint(sprintf("%4s", $label), q(cyan)) . q([)
+       . paint(substr($bar, 0, $fill), $lvl ? $lvl : q(green)) . substr($bar, $fill) . q(]);
+}
+
+sub shortname {
+  my ($inst) = @_;
+  return $inst if length($inst) <= 21;
+  my ($host, $port) = $inst =~ /^(.*):(\d+)$/;
+  return substr($host, 0, 20 - length($port) - 1) . "~:$port";
+}
+
+# usage: exit 3, the Nagios "UNKNOWN" code, so a misconfigured check is not
+# mistaken for a real alert.
+sub usage { print STDERR T('usage'); exit 3 }
+
+sub mode { T($lifetime ? 'lifetime' : $cumulative ? 'cumulative' : 'per_second') }
+
+# T: translated message, sprintf'd with any extra args.
+sub T {
+  my ($key, @args) = @_;
+  my $m = $msg{$lang}{$key} // $msg{en}{$key};
+  return @args ? sprintf($m, @args) : $m;
+}
+
+sub unit { $cumulative ? $_[0] : $_[0] eq '-' ? '-' : "$_[0]/s" }
+
+sub human_num {
+  my ($v) = @_;
+  return '-' unless defined $v;
+  return sprintf('%.1f', $v) if $v < 10 && $v != int($v);
+  return sprintf('%.0f', $v) if $v < 10000;
+  return sprintf('%.1fk', $v / 1e3) if $v < 1e6;
+  return sprintf('%.1fM', $v / 1e6) if $v < 1e9;
+  return sprintf('%.1fG', $v / 1e9);
+}
+
+sub human_bytes {
+  my ($v) = @_;
+  return '-' unless defined $v;
+  my @u = ('B', 'K', 'M', 'G', 'T');
+  my $i = 0;
+  while ($v >= 1024 && $i < $#u) { $v /= 1024; $i++ }
+  return $i ? sprintf('%.1f%s', $v, $u[$i]) : sprintf('%.0fB', $v);
+}
+
+sub human_time {
+  my ($s) = @_;
+  return sprintf('%dd%dh', $s / 86400, $s % 86400 / 3600) if $s >= 86400;
+  return sprintf('%dh%dm', $s / 3600, $s % 3600 / 60) if $s >= 3600;
+  return sprintf('%dm%ds', $s / 60, $s % 60) if $s >= 60;
+  return sprintf('%ds', $s);
 }
 ################################################################################

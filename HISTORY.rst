@@ -26,3 +26,17 @@ v0.6 - 2009-04-28 - ntang
   get/set commands, or both.  Bear in mind if you specify both you will
   exceed the width of a standard terminal!  You've been warned.  :P
   Also, some minor display changes, etc. etc.
+v0.8 - 2026-10-10
+  htop/glances-style redesign: cluster meters, OK/WARNING/CRITICAL status,
+  yellow/red levels and an ALERTS panel that says what is wrong.
+  New checks: restarts, max_connections, rejected connections.
+  Fixed: hit ratio now per interval, rates use real elapsed time, ITEMS no
+  longer always red, latency measured on a persistent connection, --oneoff
+  takes two samples and returns a Nagios-style exit code, --cumulative no
+  longer inflates thresholds every refresh.
+v0.9 - 2026-10-25 - Raphael Giovanini
+  --instances is now required; no silent default to 127.0.0.1.
+  Calmer look: Mem/Con bars take the color of the worst instance, plain
+  bold table header, OK shown as green text instead of a green block.
+  Interface in English, Portuguese and Spanish (--lang, or from LANG).
+  Bad usage exits 3 (Nagios UNKNOWN) instead of an errno.
